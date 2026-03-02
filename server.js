@@ -17,45 +17,74 @@ app.post("/screenshot", async (req, res) => {
 
   let browser;
 
-  // --- Cookie/Consent best-effort entfernen ---
+  // 1) Cookie/Consent so gut wie möglich entfernen
   async function handleCookieOverlay(page) {
+    // 1) Buttons klicken (best-effort)
     try {
-      const acceptBtn = page.getByRole("button", { name: /alle akzeptieren/i });
-      if (await acceptBtn.isVisible({ timeout: 1500 }).catch(() => false)) {
-        await acceptBtn.click({ timeout: 3000 }).catch(() => {});
-        await page.waitForTimeout(250);
-        return;
-      }
-
-      const fallbackSelectors = [
-        'button:has-text("Alle akzeptieren")',
-        'button:has-text("Akzeptieren")',
-        'button:has-text("Einverstanden")',
-        'button:has-text("Zustimmen")',
-        'button:has-text("OK")',
-        "#onetrust-accept-btn-handler",
-        '[data-testid*="accept"]',
+      const candidates = [
+        page.getByRole("button", { name: /alle akzeptieren/i }),
+        page.getByRole("button", { name: /akzeptieren/i }),
+        page.getByRole("button", { name: /zustimmen/i }),
+        page.getByRole("button", { name: /einverstanden/i }),
+        page.locator("#onetrust-accept-btn-handler"),
+        page.locator('button:has-text("Alle akzeptieren")'),
+        page.locator('button:has-text("Akzeptieren")'),
+        page.locator('button:has-text("Zustimmen")'),
+        page.locator('button:has-text("Einverstanden")'),
+        page.locator('button:has-text("OK")'),
+        page.locator('[data-testid*="accept"]'),
       ];
 
-      for (const sel of fallbackSelectors) {
-        const el = page.locator(sel).first();
-        if (await el.isVisible({ timeout: 800 }).catch(() => false)) {
-          await el.click({ timeout: 2500 }).catch(() => {});
+      for (const loc of candidates) {
+        const el = loc.first();
+        const visible = await el.isVisible({ timeout: 1200 }).catch(() => false);
+        if (visible) {
+          await el.click({ timeout: 3000 }).catch(() => {});
           await page.waitForTimeout(250);
-          return;
+          break;
         }
       }
+    } catch {
+      // ignore
+    }
 
-      // Ultimativer Fallback: Overlay entfernen (nur Automation)
+    // 2) Hard-Remove falls es trotzdem blockiert (nur für Automation/Screenshot)
+    try {
       await page.evaluate(() => {
-        const texts = ["Privatsphäre", "Cookies", "Konfigurieren", "Alle akzeptieren"];
-        const nodes = Array.from(document.querySelectorAll("div, section, aside"));
+        const textHints = [
+          "Wir schätzen Ihre Privatsphäre",
+          "Privatsphäre",
+          "Cookies",
+          "Konfigurieren",
+          "Alle akzeptieren",
+        ];
+
+        const nodes = Array.from(document.querySelectorAll("div, section, aside, dialog"));
         for (const el of nodes) {
           const t = (el.textContent || "").trim();
           if (!t) continue;
-          if (!texts.some((x) => t.includes(x))) continue;
+
+          const looksLikeConsent = textHints.some((h) => t.includes(h));
+          if (!looksLikeConsent) continue;
+
           const style = window.getComputedStyle(el);
-          if (style.position === "fixed" || style.position === "sticky") el.remove();
+          const isOverlay = style.position === "fixed" || style.position === "sticky";
+          if (isOverlay) el.remove();
+        }
+
+        // häufig: Body wird "gelockt"
+        document.documentElement.style.overflow = "auto";
+        document.body.style.overflow = "auto";
+
+        // manchmal liegt noch ein Backdrop drüber
+        const backdrops = Array.from(
+          document.querySelectorAll('[class*="backdrop"], [class*="overlay"], [id*="overlay"]')
+        );
+        for (const b of backdrops) {
+          const st = window.getComputedStyle(b);
+          if (st.position === "fixed" && st.zIndex && Number(st.zIndex) > 1000) {
+            b.remove();
+          }
         }
       });
     } catch {
@@ -63,7 +92,7 @@ app.post("/screenshot", async (req, res) => {
     }
   }
 
-  // --- Robust: Autocomplete/Overlay schließen, damit nichts Klicks blockiert ---
+  // Autocomplete/Overlay schließen, damit nichts Klicks blockiert
   async function closeOverlays(page) {
     try {
       await page.keyboard.press("Escape").catch(() => {});
@@ -75,31 +104,25 @@ app.post("/screenshot", async (req, res) => {
     }
   }
 
-  // --- Robust: Häuser klicken (nur wenn kind === haeuser) ---
+  // Häuser klicken (nur wenn kind === haeuser)
   async function clickHaeuser(page) {
-    // sehr wichtig: alles schließen, damit nichts pointer events interceptet
     await closeOverlays(page);
     await handleCookieOverlay(page);
 
     const label = page.getByText("Häuser", { exact: true }).first();
-
-    // klickbarer Container (aus deinem DOM-Snippet: .label-icon.radio-button__visual)
     const container = label
       .locator("xpath=ancestor::div[contains(@class,'radio-button__visual') or contains(@class,'label-icon')]")
       .first();
 
-    // Versuch 1: Container normal
     if (await container.isVisible({ timeout: 2500 }).catch(() => false)) {
       await container.scrollIntoViewIfNeeded().catch(() => {});
       await closeOverlays(page);
       await container.click({ timeout: 6000 }).catch(async () => {
-        // Notfall: force (wenn wieder was interceptet)
         await container.click({ timeout: 6000, force: true }).catch(() => {});
       });
       return;
     }
 
-    // Versuch 2: Label normal/force
     if (await label.isVisible({ timeout: 2000 }).catch(() => false)) {
       await label.scrollIntoViewIfNeeded().catch(() => {});
       await closeOverlays(page);
@@ -109,14 +132,13 @@ app.post("/screenshot", async (req, res) => {
       return;
     }
 
-    // Letzter Fallback
     const fuzzy = page.locator("text=Häuser").first();
     await fuzzy.click({ timeout: 6000 }).catch(async () => {
       await fuzzy.click({ timeout: 6000, force: true }).catch(() => {});
     });
   }
 
-  // --- Robust: Adressfeld finden ---
+  // Adressfeld finden
   async function findAddressInput(page) {
     const candidates = [
       () => page.getByPlaceholder(/z\.?\s*b\.?/i).first(), // "z.B. ..."
@@ -141,12 +163,8 @@ app.post("/screenshot", async (req, res) => {
     return null;
   }
 
-  // --- Einfaches "warten bis geladen" ohne weitere Aktionen ---
+  // Warten bis Ergebnis "steht"
   async function waitForResultToSettle(page) {
-    // domcontentloaded triggert bei SPA manchmal nicht neu -> deshalb:
-    // - kurz networkidle versuchen
-    // - und/oder ein Ergebnis-Signal (€/m² oder canvas) abwarten
-    await page.waitForLoadState("domcontentloaded").catch(() => {});
     await page.waitForLoadState("networkidle", { timeout: 6000 }).catch(() => {});
 
     const signals = [
@@ -160,7 +178,6 @@ app.post("/screenshot", async (req, res) => {
       if (ok) break;
     }
 
-    // kleiner Puffer für Rendering
     await page.waitForTimeout(600);
   }
 
@@ -188,7 +205,6 @@ app.post("/screenshot", async (req, res) => {
     // 4) Adresse rein + Enter
     const input = await findAddressInput(page);
     if (!input) {
-      // Debug Screenshot statt “blind” fail
       const dbg = await page.screenshot({ fullPage: true, type: "png" });
       res.setHeader("Content-Type", "image/png");
       res.setHeader("X-Debug", "input_not_found");
@@ -197,13 +213,17 @@ app.post("/screenshot", async (req, res) => {
 
     await input.click({ timeout: 3000 }).catch(() => {});
     await input.fill(address);
-    await page.keyboard.press("Enter"); // GENAU wie du willst: direkt Enter
+    await page.keyboard.press("Enter"); // genau wie du willst
 
-    // 5) Cookie kann nach Enter wieder auftauchen
+    // Falls Cookie erst NACH Enter hochpoppt: einmal sofort versuchen
     await handleCookieOverlay(page);
 
-    // 6) warten + screenshot
+    // 5) warten bis Ergebnis steht
     await waitForResultToSettle(page);
+
+    // 6) LAST CLEANUP direkt vor Screenshot
+    await handleCookieOverlay(page);
+    await page.waitForTimeout(200);
 
     const buffer = await page.screenshot({ fullPage: true, type: "png" });
     res.setHeader("Content-Type", "image/png");
