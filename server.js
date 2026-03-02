@@ -103,26 +103,47 @@ app.post("/screenshot", async (req, res) => {
     // 2) Objektart wählen (BEVOR Adresse)
     await selectKind(page, kind);
 
-    // 3) Adressfeld finden (robust)
+    // 3) Adressfeld finden (robust + warten + retry)
     const inputCandidates = [
-      'input[placeholder*="z.B."]',
-      'input[placeholder*="Adresse"]',
-      'input[type="search"]',
-      'input[type="text"]',
+      () => page.getByPlaceholder(/z\.?\s*b\.?/i).first(),     // "z.B. ..."
+      () => page.getByPlaceholder(/adresse/i).first(),
+      () => page.getByRole("textbox").first(),
+      () => page.locator('input[type="search"]').first(),
     ];
 
     let input = null;
-    for (const sel of inputCandidates) {
-      const loc = page.locator(sel).first();
-      if (await loc.count()) {
-        try {
-          await loc.click({ timeout: 2000 });
+
+    for (let attempt = 1; attempt <= 3 && !input; attempt++) {
+      // kurze Wartezeit + ggf. Cookie nochmal weg (manchmal poppt er „später“)
+      await page.waitForTimeout(500);
+      await handleCookieOverlay(page);
+
+      for (const makeLoc of inputCandidates) {
+        const loc = makeLoc();
+        const visible = await loc.isVisible({ timeout: 2000 }).catch(() => false);
+        if (visible) {
           input = loc;
           break;
-        } catch {}
+        }
+      }
+
+      // falls immer noch nichts: einmal kurz "networkidle" abwarten
+      if (!input) {
+        await page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => {});
       }
     }
-    if (!input) throw new Error("Adress-Eingabefeld nicht gefunden.");
+
+    if (!input) {
+      // Debug: Screenshot damit du siehst, was Playwright sieht (kommt als PNG zurück)
+      const dbg = await page.screenshot({ fullPage: true, type: "png" });
+      res.setHeader("Content-Type", "image/png");
+      res.setHeader("X-Debug", "input_not_found");
+      return res.status(200).send(dbg);
+      // Alternativ: throw new Error("Adress-Eingabefeld nicht gefunden.");
+    }
+
+    await input.click({ timeout: 2000 });
+    await input.fill(address);
 
     // 4) Adresse eintragen
     await input.fill(address);
