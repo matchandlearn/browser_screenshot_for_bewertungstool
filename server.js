@@ -17,6 +17,73 @@ app.post("/screenshot", async (req, res) => {
 
   let browser;
 
+  // --- helper: Cookie/Consent so gut wie möglich entfernen ---
+  async function handleCookieOverlay(page) {
+    try {
+      const acceptBtn = page.getByRole("button", { name: /alle akzeptieren/i });
+
+      if (await acceptBtn.isVisible({ timeout: 1500 }).catch(() => false)) {
+        await acceptBtn.click({ timeout: 3000 }).catch(() => {});
+        await page.waitForTimeout(300);
+        return;
+      }
+
+      const fallbackSelectors = [
+        'button:has-text("Alle akzeptieren")',
+        'button:has-text("Akzeptieren")',
+        'button:has-text("Einverstanden")',
+        'button:has-text("Zustimmen")',
+        'button:has-text("OK")',
+        "#onetrust-accept-btn-handler",
+        '[data-testid*="accept"]',
+      ];
+
+      for (const sel of fallbackSelectors) {
+        const el = page.locator(sel).first();
+        if (await el.isVisible({ timeout: 800 }).catch(() => false)) {
+          await el.click({ timeout: 2500 }).catch(() => {});
+          await page.waitForTimeout(300);
+          return;
+        }
+      }
+
+      // Ultimativer Fallback: Overlay entfernen (nur für Screenshot/Automation)
+      await page.evaluate(() => {
+        const texts = ["Privatsphäre", "Cookies", "Konfigurieren", "Alle akzeptieren"];
+        const nodes = Array.from(document.querySelectorAll("div, section, aside"));
+        for (const el of nodes) {
+          const t = (el.textContent || "").trim();
+          if (!t) continue;
+          if (!texts.some((x) => t.includes(x))) continue;
+
+          const style = window.getComputedStyle(el);
+          if (style.position === "fixed" || style.position === "sticky") {
+            el.remove();
+          }
+        }
+      });
+    } catch {
+      // egal – wir wollen trotzdem weiterlaufen
+    }
+  }
+
+  // --- helper: Objektart sicher klicken (nicht nur "text=Häuser") ---
+  async function selectKind(page, kind) {
+    // Auf Homeday ist es eine Art "Radio Card" -> klick am besten auf den sichtbaren Text
+    const targetText = kind === "wohnungen" ? "Wohnungen" : "Häuser";
+
+    // 1) Erst versuchen: exakter Text
+    const textLoc = page.getByText(targetText, { exact: true }).first();
+    if (await textLoc.isVisible({ timeout: 2500 }).catch(() => false)) {
+      await textLoc.click({ timeout: 4000 });
+      return;
+    }
+
+    // 2) Fallback: contains
+    const fuzzy = page.locator(`text=${targetText}`).first();
+    await fuzzy.click({ timeout: 4000 });
+  }
+
   try {
     browser = await chromium.launch({ headless: true });
 
@@ -30,7 +97,13 @@ app.post("/screenshot", async (req, res) => {
     // 1) Seite öffnen
     await page.goto("https://www.homeday.de/preisatlas/", { waitUntil: "domcontentloaded" });
 
-    // 2) Adressfeld finden (robust)
+    // Cookie direkt am Anfang weg, damit nichts blockiert
+    await handleCookieOverlay(page);
+
+    // 2) Objektart wählen (BEVOR Adresse)
+    await selectKind(page, kind);
+
+    // 3) Adressfeld finden (robust)
     const inputCandidates = [
       'input[placeholder*="z.B."]',
       'input[placeholder*="Adresse"]',
@@ -51,99 +124,59 @@ app.post("/screenshot", async (req, res) => {
     }
     if (!input) throw new Error("Adress-Eingabefeld nicht gefunden.");
 
+    // 4) Adresse eintragen
     await input.fill(address);
+    await page.waitForTimeout(250); // kurz warten, damit Autocomplete auftaucht
 
-    // Autocomplete: Enter + optional erster Vorschlag
-    await page.keyboard.press("Enter");
-    try {
-      const firstSuggestion = page.locator('[role="listbox"] [role="option"]').first();
-      if (await firstSuggestion.count()) {
-        await firstSuggestion.click({ timeout: 2000 });
-      }
-    } catch {}
+    // 5) Enter drücken – aber so, dass zuerst Vorschlag gewählt wird:
+    // ArrowDown + Enter selektiert meist den ersten Vorschlag, ohne "direkt weiter" zu feuern
+    const listboxOption = page.locator('[role="listbox"] [role="option"]').first();
 
-    // 3) Wohnungen/Häuser wählen
-    if (kind === "wohnungen") {
-      await page.locator("text=Wohnungen").first().click({ timeout: 5000 });
+    const hasSuggestions = await listboxOption.isVisible({ timeout: 2500 }).catch(() => false);
+
+    if (hasSuggestions) {
+      await page.keyboard.press("ArrowDown");
+      await page.keyboard.press("Enter");
     } else {
-      await page.locator("text=Häuser").first().click({ timeout: 5000 });
+      // Wenn keine Suggestions auftauchen: Enter trotzdem (wie du wolltest)
+      await page.keyboard.press("Enter");
     }
 
-    // 4) Preise anzeigen
+    // SEHR WICHTIG:
+    // Homeday kann nach dem Enter direkt ins Ergebnis springen und dabei "Wohnungen" als Default setzen.
+    // Deshalb: Objektart NACH dem Enter nochmal sicher setzen.
+    await page.waitForTimeout(300);
+    await selectKind(page, kind);
+
+    // Cookie ggf. nochmal (manchmal poppt er erst nach Interaktion)
+    await handleCookieOverlay(page);
+
+    // 6) Preise anzeigen
     await page.locator("text=Preise anzeigen").first().click({ timeout: 8000 });
 
-    // 5) Kurze Wartezeit, damit Ergebnis initial lädt
-    await page.waitForTimeout(1200);
+    // 7) Nach dem Klick: Cookie/Overlay nochmal, falls es wieder drüber liegt
+    await page.waitForTimeout(600);
+    await handleCookieOverlay(page);
 
-    // 6) Cookie Banner handling (Homeday) - nach dem Ergebnis-Klick
-    try {
-      const acceptBtn = page.getByRole("button", { name: /alle akzeptieren/i });
-
-      if (await acceptBtn.isVisible({ timeout: 2500 }).catch(() => false)) {
-        await acceptBtn.click({ timeout: 5000 });
-        await page.waitForTimeout(500);
-      } else {
-        const fallbackSelectors = [
-          'button:has-text("Alle akzeptieren")',
-          'button:has-text("Akzeptieren")',
-          'button:has-text("Einverstanden")',
-          'button:has-text("Zustimmen")',
-          'button:has-text("OK")',
-          '[data-testid*="accept"]',
-          "#onetrust-accept-btn-handler",
-        ];
-
-        for (const sel of fallbackSelectors) {
-          const el = page.locator(sel).first();
-          if (await el.isVisible({ timeout: 1200 }).catch(() => false)) {
-            await el.click({ timeout: 5000 }).catch(() => {});
-            await page.waitForTimeout(500);
-            break;
-          }
-        }
-      }
-
-      // Ultimativer Fallback: wenn Overlay trotzdem bleibt, entfernen (nur fürs Screenshot!)
-      await page.evaluate(() => {
-        const texts = ["Privatsphäre", "Cookies", "Konfigurieren", "Alle akzeptieren"];
-        const candidates = Array.from(document.querySelectorAll("div, section, aside"));
-        for (const el of candidates) {
-          const t = (el.textContent || "").trim();
-          if (t && texts.some((x) => t.includes(x))) {
-            const style = window.getComputedStyle(el);
-            if (style.position === "fixed" || style.position === "sticky") {
-              el.remove();
-            }
-          }
-        }
-      });
-    } catch {
-      // ignoriere — Screenshot soll trotzdem durchlaufen
-    }
-
-    // 7) Signal: Preis €/m² sichtbar ODER Map vorhanden
-    const signals = [
-      'text=/€\\s*\\/\\s*m²/i',
-      'text=/€\\/m²/i',
-      "canvas",
-      "text=mapbox",
-    ];
-
+    // 8) Signal: Preis €/m² sichtbar ODER Map vorhanden
+    const signals = ['text=/€\\s*\\/\\s*m²/i', "canvas", "text=mapbox"];
     let signalOk = false;
+
     for (const s of signals) {
       try {
-        await page.locator(s).first().waitFor({ state: "visible", timeout: 8000 });
+        await page.locator(s).first().waitFor({ state: "visible", timeout: 10000 });
         signalOk = true;
         break;
       } catch {}
     }
 
-    // 8) Screenshot
+    // 9) Screenshot
     const buffer = await page.screenshot({ fullPage: true, type: "png" });
 
     res.setHeader("Content-Type", "image/png");
     if (!signalOk) res.setHeader("X-Debug", "result_signal_not_confirmed");
     return res.status(200).send(buffer);
+
   } catch (e) {
     return res.status(500).json({ error: e.message || "unknown error" });
   } finally {
