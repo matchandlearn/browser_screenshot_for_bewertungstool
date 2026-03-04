@@ -223,8 +223,13 @@ app.post("/screenshot", async (req, res) => {
 
     // 6) LAST CLEANUP direkt vor Screenshot
     await handleCookieOverlay(page);
-    await page.waitForTimeout(200);
-
+    
+    // warte bis Karte wirklich im DOM ist (Mapbox)
+    await page.waitForSelector("canvas", { timeout: 15000 }).catch(() => {});
+    
+    // dann 5 Sekunden Render-Puffer
+    await page.waitForTimeout(5000);
+    
     const buffer = await page.screenshot({ fullPage: true, type: "png" });
     res.setHeader("Content-Type", "image/png");
     return res.status(200).send(buffer);
